@@ -1,0 +1,598 @@
+"""
+PDF Image Extractor Module
+Converts PDF pages to images and sends them to LLM for data extraction.
+Uses preprocessing context from pdf_processor.py as supplementary information.
+"""
+
+import os
+import io
+import base64
+import tempfile
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
+from dotenv import load_dotenv
+import requests
+
+# PDF processing
+import fitz  # PyMuPDF
+from PIL import Image
+
+# Local imports
+from logger_setup import get_logger
+from pdf_processor import process_pdf, clean_text
+from destination_srv import (
+    get_destination_service_credentials,
+    generate_token,
+    fetch_destination_details,
+    extract_aicore_credentials
+)
+from env_config import MODEL_ID
+
+# Initialize logger
+logger = get_logger()
+load_dotenv()
+
+# ===== Initialize AIC Credentials =====
+logger.info("====> pdf_image_extractor.py -> AIC CREDENTIALS <====")
+
+vcap_services = os.environ.get("VCAP_SERVICES")
+destination_service_credentials = get_destination_service_credentials(vcap_services)
+
+try:
+    oauth_token = generate_token(
+        uri=destination_service_credentials['dest_auth_url'] + "/oauth/token",
+        client_id=destination_service_credentials['clientid'],
+        client_secret=destination_service_credentials['clientsecret']
+    )
+except requests.exceptions.HTTPError as e:
+    if e.response is not None and e.response.status_code == 500:
+        raise Exception("HTTP 500: Check if the client secret is correct.") from e
+    else:
+        raise
+
+# Get AIC details from Dest Services
+dest_AIC = "GENAI_AI_CORE"
+aicore_details = fetch_destination_details(
+    destination_service_credentials['dest_base_url'],
+    dest_AIC,
+    oauth_token
+)
+AIC_CREDENTIALS = extract_aicore_credentials(aicore_details)
+
+from gen_ai_hub.proxy import GenAIHubProxyClient
+from gen_ai_hub.proxy.native.amazon.clients import Session
+
+logger.info(f"PDF Image Extractor: AIC Credentials loaded")
+
+proxy_client = GenAIHubProxyClient(
+    base_url=AIC_CREDENTIALS['aic_base_url'],
+    auth_url=AIC_CREDENTIALS['aic_auth_url'],
+    client_id=AIC_CREDENTIALS['clientid'],
+    client_secret=AIC_CREDENTIALS['clientsecret'],
+    resource_group=AIC_CREDENTIALS['resource_group']
+)
+
+
+def get_bedrock_client(model_id: str):
+    """Create Bedrock client with proxy."""
+    session = Session()
+    return session.client(model_name=model_id, proxy_client=proxy_client)
+
+
+def pdf_page_to_image(pdf_path: str, page_num: int, dpi: int = 300) -> Tuple[bytes, str]:
+    """
+    Convert a specific PDF page to a high-resolution image.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        page_num: Page number (0-indexed)
+        dpi: Resolution for rendering (default 300 for quality)
+    
+    Returns:
+        Tuple of (image_bytes, format)
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        
+        if page_num >= len(doc):
+            raise ValueError(f"Page {page_num} does not exist. PDF has {len(doc)} pages.")
+        
+        page = doc[page_num]
+        
+        # Calculate zoom factor for desired DPI (72 is default PDF DPI)
+        zoom = dpi / 72
+        mat = fitz.Matrix(zoom, zoom)
+        
+        # Render page to pixmap
+        pix = page.get_pixmap(matrix=mat)
+        
+        # Convert to PNG bytes
+        img_bytes = pix.tobytes("png")
+        
+        doc.close()
+        
+        logger.info(f"Converted page {page_num + 1} to image ({pix.width}x{pix.height})")
+        return img_bytes, "png"
+        
+    except Exception as e:
+        logger.error(f"Error converting page {page_num} to image: {str(e)}")
+        raise
+
+
+def get_pdf_page_count(pdf_path: str) -> int:
+    """Get the total number of pages in a PDF."""
+    doc = fitz.open(pdf_path)
+    count = len(doc)
+    doc.close()
+    return count
+
+
+def get_preprocessing_context(pdf_path: str, page_num: int) -> str:
+    """
+    Extract preprocessing context from PDF using existing pdf_processor.
+    This provides textual context that may help the LLM but might be inaccurate.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        page_num: Page number (0-indexed)
+    
+    Returns:
+        Extracted text context for the specific page
+    """
+    try:
+        # Use PyPDFLoader for page-specific text
+        from langchain_community.document_loaders import PyPDFLoader
+        
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+        
+        if page_num < len(documents):
+            page_text = documents[page_num].page_content
+            return clean_text(page_text)
+        
+        return ""
+        
+    except Exception as e:
+        logger.warning(f"Could not extract preprocessing context for page {page_num}: {str(e)}")
+        return ""
+
+
+def extract_tables_context(pdf_path: str, page_num: int) -> str:
+    """
+    Extract table context from a specific PDF page using pdfplumber.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        page_num: Page number (0-indexed)
+    
+    Returns:
+        Extracted table text
+    """
+    try:
+        import pdfplumber
+        
+        with pdfplumber.open(pdf_path) as pdf:
+            if page_num < len(pdf.pages):
+                page = pdf.pages[page_num]
+                tables = page.extract_tables()
+                
+                if tables:
+                    table_texts = []
+                    for idx, table in enumerate(tables):
+                        if table and len(table) > 0:
+                            # Convert table to simple text representation
+                            rows = []
+                            for row in table:
+                                row_text = " | ".join(str(cell) if cell else "" for cell in row)
+                                rows.append(row_text)
+                            table_texts.append(f"Table {idx + 1}:\n" + "\n".join(rows))
+                    
+                    return "\n\n".join(table_texts)
+        
+        return ""
+        
+    except Exception as e:
+        logger.warning(f"Could not extract table context for page {page_num}: {str(e)}")
+        return ""
+
+
+def send_image_to_llm(
+    image_bytes: bytes,
+    image_format: str,
+    preprocessing_context: str,
+    page_num: int,
+    total_pages: int
+) -> str:
+    """
+    Send image to LLM for data extraction with preprocessing context.
+    
+    Args:
+        image_bytes: Image data as bytes
+        image_format: Image format (png, jpg, etc.)
+        preprocessing_context: Text context from preprocessing (may be inaccurate)
+        page_num: Current page number (1-indexed for display)
+        total_pages: Total number of pages
+    
+    Returns:
+        Extracted text in markdown format
+    """
+    try:
+        bedrock_client = get_bedrock_client(MODEL_ID)
+        
+        # Build the enhanced extraction prompt with multi-column awareness and chart extraction
+        prompt = f"""You are a meticulous financial document extraction specialist. You must extract EVERY piece of text from this document image (Page {page_num} of {total_pages}).
+
+## CRITICAL LAYOUT INSTRUCTIONS:
+⚠️ This document may have MULTIPLE COLUMNS (2, 3, or more columns side by side).
+⚠️ You MUST scan the ENTIRE page from LEFT to RIGHT, TOP to BOTTOM.
+⚠️ Do NOT skip any column or section - extract content from ALL areas of the page.
+
+## CONTENT TO EXTRACT (ALL are equally important):
+1. **Structured Data**: Tables, metrics, KPIs, financial figures, percentages
+2. **Narrative Text**: Paragraphs, executive commentary, analysis sections
+3. **Quotes**: CEO/CFO quotes, management commentary (often in italics or separate boxes)
+4. **Headers/Titles**: All headings, subheadings, section labels
+5. **Lists**: Bullet points, numbered items, highlights
+6. **Footnotes**: Small text at bottom, superscript references, disclaimers
+7. **Labels**: Axis labels, chart annotations, figure captions
+8. **Charts/Graphs**: All visual data representations (waterfall, bar, line, pie charts)
+
+## EXTRACTION RULES:
+- Extract text VERBATIM - do not summarize or paraphrase
+- Preserve the EXACT numbers, including decimals and units (%, $, billion, million, bps)
+- Maintain hierarchical structure with markdown headings (# ## ###)
+- For tables, use markdown table format with proper alignment
+- For quotes, use blockquote format (> quote text) or *italics*
+- Include speaker attribution for quotes (e.g., "Jamie Dimon, CEO, stated:")
+- Capture ALL footnote markers (¹, ², ³, etc.) and their corresponding text
+
+## LAYOUT HANDLING:
+- If there are multiple columns, extract LEFT column first, then RIGHT column
+- Clearly separate content from different columns with section breaks
+- If a column contains quotes/commentary, label it as "### Executive Commentary" or similar
+
+## CHART AND GRAPH EXTRACTION:
+For any charts, graphs, diagrams, or visual data representations:
+
+### Core Extraction Principles:
+- Extract ALL visible numerical values (totals, components, segments, data points)
+- Capture both AGGREGATE values and their COMPONENT PARTS/BREAKDOWNS
+- Map color-coded legends to their corresponding data values
+- Include axis labels, titles, units (%, $, B, M, bps, YoY, QoQ, etc.)
+- Use parentheses for negative values: (62 bps), ($2.0)
+
+### Data to Extract:
+1. **Totals & Aggregates**: Main values displayed on or above chart elements
+2. **Components & Segments**: Sub-values within stacked, grouped, or segmented visuals
+3. **Starting & Ending Points**: For bridge/waterfall charts, capture beginning and final values
+4. **Period Comparisons**: YoY, QoQ, or period-to-period changes
+5. **Trends & Directions**: Growth/decline indicators, arrows, trend annotations
+6. **Highlights**: Circled, boxed, or color-emphasized values (mark with **bold**)
+7. **Annotations**: Callout text, footnote markers, explanatory notes
+
+### Visual Elements:
+- Note what each color/pattern represents per the legend
+- If a chart has multiple data series, extract each series separately
+- If component values aren't individually labeled on the visual:
+  - Extract ONLY the TOTAL value that IS visibly labeled 
+  - Do NOT create misleading columns with partial values or placeholders like "Portion of..."
+  - Do NOT fabricate or estimate values that aren't clearly shown
+
+### Output Format:
+Present chart data as markdown tables:
+| Category/Period | Component 1 | Component 2 | Total |
+|-----------------|-------------|-------------|-------|
+| 4Q24 | XX | YY | ZZ |
+| 4Q25 | AA | BB | CC |
+
+For waterfall/bridge charts:
+| Component | Value/Change |
+|-----------|--------------|
+| Starting (Period) | XX |
+| Driver 1 | +YY |
+| Driver 2 | (ZZ) |
+| **Ending (Period)** | **XX** |
+
+### Chart Output Structure (MANDATORY - For Better Data Chunking):
+⚠️ For EACH chart, keep the summary and detailed data TOGETHER as a self-contained section.
+
+**Structure for EACH chart:**
+
+## [Chart Title]
+*Summary: [3-4 sentences describing: (1) what the chart shows, (2) key numbers and trends, (3) the main insight or business implication]*
+
+### Data:
+[Extracted data in markdown table or list format - include all values, components, and periods visible in the chart]
+
+---
+
+**Rules:**
+- ⚠️ Do NOT create a separate "Chart Summaries" section - summaries must be inline with their data
+- ⚠️ Do NOT separate summaries from their corresponding data
+- Each chart must be a SELF-CONTAINED section following this order: Title → Summary → Data → Separator (---)
+- Count all charts on the page → Create exactly that many self-contained sections
+- This structure enables better data chunking for downstream retrieval and processing
+
+## FORMATTING OUTPUT:
+- Use markdown syntax throughout
+- Tables: | Header | Header | format
+- Bold: **important terms**
+- Italics: *quotes and emphasis*
+- Blockquotes: > for extended quotes
+
+## PREPROCESSING CONTEXT (reference only - may contain errors, verify against image):
+---
+{preprocessing_context if preprocessing_context else "No preprocessing context available"}
+---
+
+## OUTPUT:
+Extract ALL content now. Start directly with the document content, no introduction.
+"""
+
+        # Prepare message with image
+        message = {
+            "role": "user",
+            "content": [
+                {"text": prompt},
+                {
+                    "image": {
+                        "format": image_format,
+                        "source": {"bytes": image_bytes}
+                    }
+                }
+            ]
+        }
+        
+        # Send to Bedrock
+        response = bedrock_client.converse(
+            modelId=MODEL_ID,
+            messages=[message]
+        )
+        
+        # Extract response text
+        output_message = response['output']['message']
+        result_text = ""
+        for content in output_message['content']:
+            if 'text' in content:
+                result_text += content['text']
+        
+        logger.info(f"Successfully extracted content from page {page_num}")
+        return result_text.strip()
+        
+    except Exception as e:
+        logger.error(f"Error sending image to LLM: {str(e)}")
+        raise
+
+
+def extract_pdf_to_markdown(
+    pdf_path: str,
+    output_dir: str = None,
+    pages: List[int] = None,
+    dpi: int = 300
+) -> str:
+    """
+    Main function to extract PDF content to markdown using image-based LLM extraction.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        output_dir: Directory for output (default: scripts/Documents/)
+        pages: List of specific pages to process (0-indexed), None for all pages
+        dpi: Resolution for image conversion
+    
+    Returns:
+        Path to the generated markdown file
+    """
+    logger.info(f"Starting PDF extraction: {pdf_path}")
+    
+    # Validate PDF exists
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    
+    # Set default output directory
+    if output_dir is None:
+        output_dir = os.path.join(os.path.dirname(__file__), "Documents")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Get page count
+    total_pages = get_pdf_page_count(pdf_path)
+    logger.info(f"PDF has {total_pages} pages")
+    
+    # Determine pages to process
+    if pages is None:
+        pages_to_process = list(range(total_pages))
+    else:
+        pages_to_process = [p for p in pages if 0 <= p < total_pages]
+    
+    if not pages_to_process:
+        raise ValueError("No valid pages to process")
+    
+    logger.info(f"Processing pages: {[p + 1 for p in pages_to_process]}")
+    
+    # Extract content from each page
+    extracted_pages = []
+    pdf_filename = os.path.basename(pdf_path)
+    
+    for page_num in pages_to_process:
+        logger.info(f"Processing page {page_num + 1}/{total_pages}")
+        
+        try:
+            # Convert page to image
+            image_bytes, image_format = pdf_page_to_image(pdf_path, page_num, dpi)
+            
+            # Get preprocessing context
+            text_context = get_preprocessing_context(pdf_path, page_num)
+            table_context = extract_tables_context(pdf_path, page_num)
+            
+            # Combine contexts
+            full_context = ""
+            if text_context:
+                full_context += f"Text Content:\n{text_context}\n\n"
+            if table_context:
+                full_context += f"Table Content:\n{table_context}"
+            
+            # Send to LLM for extraction
+            extracted_content = send_image_to_llm(
+                image_bytes=image_bytes,
+                image_format=image_format,
+                preprocessing_context=full_context,
+                page_num=page_num + 1,
+                total_pages=total_pages
+            )
+            
+            extracted_pages.append({
+                "page": page_num + 1,
+                "content": extracted_content
+            })
+            
+            logger.info(f"Page {page_num + 1} extracted successfully")
+            
+        except Exception as e:
+            logger.error(f"Error processing page {page_num + 1}: {str(e)}")
+            extracted_pages.append({
+                "page": page_num + 1,
+                "content": f"*Error extracting page {page_num + 1}: {str(e)}*"
+            })
+    
+    # Combine all pages into final markdown
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    markdown_content = f"""# Extracted Content: {pdf_filename}
+
+> **Generated by:** FinSight.Intelligence - PDF Image Extractor  
+> **Source File:** {pdf_filename}  
+> **Extraction Date:** {timestamp}  
+> **Pages Processed:** {len(pages_to_process)} of {total_pages}  
+> **Note:** Content extracted using vision-based AI. Please verify accuracy.
+
+---
+
+"""
+    
+    for page_data in extracted_pages:
+        markdown_content += f"""
+## Page {page_data['page']}
+
+{page_data['content']}
+
+---
+
+"""
+    
+    # Generate output filename
+    base_name = os.path.splitext(pdf_filename)[0]
+    output_filename = f"{base_name}_extracted.md"
+    output_path = os.path.join(output_dir, output_filename)
+    
+    # Save markdown file
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(markdown_content)
+    
+    logger.info(f"Extraction complete. Output saved to: {output_path}")
+    print(f"✅ Extraction complete: {output_path}")
+    
+    return output_path
+
+
+def extract_single_page(
+    pdf_path: str,
+    page_num: int,
+    dpi: int = 300
+) -> str:
+    """
+    Extract content from a single PDF page.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        page_num: Page number (0-indexed)
+        dpi: Resolution for image conversion
+    
+    Returns:
+        Extracted markdown content
+    """
+    total_pages = get_pdf_page_count(pdf_path)
+    
+    if page_num < 0 or page_num >= total_pages:
+        raise ValueError(f"Invalid page number {page_num}. PDF has {total_pages} pages (0-indexed).")
+    
+    # Convert page to image
+    image_bytes, image_format = pdf_page_to_image(pdf_path, page_num, dpi)
+    
+    # Get preprocessing context
+    text_context = get_preprocessing_context(pdf_path, page_num)
+    table_context = extract_tables_context(pdf_path, page_num)
+    
+    full_context = ""
+    if text_context:
+        full_context += f"Text Content:\n{text_context}\n\n"
+    if table_context:
+        full_context += f"Table Content:\n{table_context}"
+    
+    # Send to LLM
+    extracted_content = send_image_to_llm(
+        image_bytes=image_bytes,
+        image_format=image_format,
+        preprocessing_context=full_context,
+        page_num=page_num + 1,
+        total_pages=total_pages
+    )
+    
+    return extracted_content
+
+
+# ===== Command-line Interface =====
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Extract PDF content to markdown using image-based LLM extraction"
+    )
+    parser.add_argument(
+        "pdf_path",
+        help="Path to the PDF file"
+    )
+    parser.add_argument(
+        "--output-dir", "-o",
+        default=None,
+        help="Output directory for markdown file (default: scripts/Documents/)"
+    )
+    parser.add_argument(
+        "--pages", "-p",
+        type=str,
+        default=None,
+        help="Specific pages to process (comma-separated, 1-indexed). E.g., '1,2,5' or '1-10'"
+    )
+    parser.add_argument(
+        "--dpi", "-d",
+        type=int,
+        default=300,
+        help="DPI for image conversion (default: 300)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Parse page numbers
+    pages = None
+    if args.pages:
+        pages = []
+        for part in args.pages.split(','):
+            part = part.strip()
+            if '-' in part:
+                start, end = part.split('-')
+                pages.extend(range(int(start) - 1, int(end)))
+            else:
+                pages.append(int(part) - 1)
+    
+    # Run extraction
+    try:
+        output_path = extract_pdf_to_markdown(
+            pdf_path=args.pdf_path,
+            output_dir=args.output_dir,
+            pages=pages,
+            dpi=args.dpi
+        )
+        print(f"\n✅ Output saved to: {output_path}")
+    except Exception as e:
+        print(f"\n❌ Extraction failed: {str(e)}")
+        logger.error(f"Extraction failed: {str(e)}", exc_info=True)
