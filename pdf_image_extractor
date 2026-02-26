@@ -109,7 +109,17 @@ def pdf_page_to_image(pdf_path: str, page_num: int, dpi: int = 300) -> Tuple[byt
         
         # Convert to PNG bytes
         img_bytes = pix.tobytes("png")
+
+        # DEBUG: Save image for inspection
+        debug_path = f"/home/user/projects/EarningsAI_V2_Final/scripts/Images/debug_page_{page_num+1}.png"
+        with open(debug_path, 'wb') as f:
+            f.write(img_bytes)
+        logger.info(f"DEBUG: Saved image to {debug_path}")
         
+        doc.close()
+        
+        logger.info(f"Converted page {page_num + 1} to image ({pix.width}x{pix.height})")
+        return img_bytes, "png"
         doc.close()
         
         logger.info(f"Converted page {page_num + 1} to image ({pix.width}x{pix.height})")
@@ -220,7 +230,7 @@ def send_image_to_llm(
     try:
         bedrock_client = get_bedrock_client(MODEL_ID)
         
-        # Build the enhanced extraction prompt with multi-column awareness and chart extraction
+        # Build the enhanced extraction prompt with multi-column awareness, chart extraction, and large table handling
         prompt = f"""You are a meticulous financial document extraction specialist. You must extract EVERY piece of text from this document image (Page {page_num} of {total_pages}).
 
 ## CRITICAL LAYOUT INSTRUCTIONS:
@@ -245,7 +255,7 @@ def send_image_to_llm(
 - For tables, use markdown table format with proper alignment
 - For quotes, use blockquote format (> quote text) or *italics*
 - Include speaker attribution for quotes (e.g., "Jamie Dimon, CEO, stated:")
-- Capture ALL footnote markers (¹, ², ³, etc.) and their corresponding text
+- Capture ALL footnote markers (¹, ², ³, a, b, c, etc.) and their corresponding text
 
 ## LAYOUT HANDLING:
 - If there are multiple columns, extract LEFT column first, then RIGHT column
@@ -276,10 +286,10 @@ For any charts, graphs, diagrams, or visual data representations:
 - If a chart has multiple data series, extract each series separately
 - If component values aren't individually labeled on the visual:
   - Extract ONLY the TOTAL value that IS visibly labeled 
-  - Do NOT create misleading columns with partial values or placeholders like "Portion of..."
+  - Do NOT create misleading columns with partial values or placeholders
   - Do NOT fabricate or estimate values that aren't clearly shown
 
-### Output Format:
+### Chart Output Format:
 Present chart data as markdown tables:
 | Category/Period | Component 1 | Component 2 | Total |
 |-----------------|-------------|-------------|-------|
@@ -294,32 +304,132 @@ For waterfall/bridge charts:
 | Driver 2 | (ZZ) |
 | **Ending (Period)** | **XX** |
 
-### Chart Output Structure (MANDATORY - For Better Data Chunking):
-⚠️ For EACH chart, keep the summary and detailed data TOGETHER as a self-contained section.
+### Chart Section Structure (MANDATORY):
+⚠️ For EACH chart, graph, or visual diagram, output as a SELF-CONTAINED section using this EXACT format:
 
-**Structure for EACH chart:**
+<!-- SECTION_ID: [descriptive_slug_based_on_content] -->
+## [Exact Chart Title from Image]
 
-## [Chart Title]
-*Summary: [3-4 sentences describing: (1) what the chart shows, (2) key numbers and trends, (3) the main insight or business implication]*
+**Summary:** [REQUIRED - 2-4 sentences answering: (1) What type of visual is this and what does it show? (2) What are the key starting/ending values or main data points? (3) What is the primary trend, change, or business insight? MUST include specific numbers extracted from the image.]
 
 ### Data:
-[Extracted data in markdown table or list format - include all values, components, and periods visible in the chart]
+[Markdown table with ALL values extracted from the visual]
+
+### Key Insights:
+- [Insight derived from the extracted data with specific numbers]
+- [Additional insight if applicable]
+
+*Footnotes:*
+[Any footnotes referenced in this visual, extracted verbatim]
 
 ---
 
-**Rules:**
-- ⚠️ Do NOT create a separate "Chart Summaries" section - summaries must be inline with their data
-- ⚠️ Do NOT separate summaries from their corresponding data
-- Each chart must be a SELF-CONTAINED section following this order: Title → Summary → Data → Separator (---)
-- Count all charts on the page → Create exactly that many self-contained sections
-- This structure enables better data chunking for downstream retrieval and processing
+⚠️ CRITICAL RULES FOR CHART SUMMARIES:
+1. The **Summary:** line is MANDATORY for every visual - NEVER skip it
+2. Summary MUST contain actual numbers extracted from the image
+3. Generic summaries without specific values are NOT acceptable
+4. For waterfall/bridge charts: include start value, all drivers with +/- amounts, and end value
+5. For bar charts: include the compared values and percentage changes
+6. For trend charts: include direction and magnitude of change
+
+### Example Format (Illustrative - Replace with Actual Extracted Data):
+
+<!-- SECTION_ID: [metric]_movement_[period] -->
+## [Metric Name] [Chart Type]
+
+**Summary:** [Chart type] showing [metric] movement from [Period A] ([extracted start value]) to [Period B] ([extracted end value]), representing a [X]% [increase/decrease]. The change was driven by [Driver 1] ([+/- extracted value]) and [Driver 2] ([+/- extracted value]), [partially offset by / further increased by] [Factor] ([+/- extracted value]).
+
+### Data:
+| Component | Value |
+|-----------|-------|
+| [Period A] Starting | [extracted value with units] |
+| [Driver/Component 1] | [+extracted value] |
+| [Driver/Component 2] | [+extracted value] |
+| [Offsetting Factor] | ([extracted value]) |
+| **[Period B] Ending** | **[extracted value with units]** |
+
+### Key Insights:
+- [Driver] contributed [X]% of the total change
+- [Observation about trend/pattern with specific extracted numbers]
+
+*Footnotes:*
+[Extracted footnote text verbatim from the image]
+
+---
+
+⚠️ IMPORTANT: The example above shows the STRUCTURE only. Replace ALL bracketed placeholders with actual values extracted from the document image. Do NOT output bracketed placeholders in your extraction.
+---
+
+## LARGE TABLE HANDLING (Financial Statements, Multi-Section Tables):
+
+When extracting large tables with multiple logical sections (Income Statement, Balance Sheet, detailed breakdowns):
+
+### Section Splitting Rules:
+1. **Split by logical section headers** (e.g., REVENUE, EXPENSES, ASSETS, LIABILITIES)
+2. **Each section MUST include the FULL column header row**
+3. **Keep subtotals/totals with their section** (e.g., TOTAL REVENUE stays with Revenue rows)
+4. **Include inline footnotes** - place footnotes immediately after the section they belong to
+
+### Output Format for Large Tables:
+
+<!-- SECTION_ID: [document]_[section_name] -->
+## [Document Title] - [Section Name]
+
+| METRIC | Period1 | Period2 | Period3 | Change |
+|--------|---------|---------|---------|--------|
+| Line item 1 | value | value | value | change |
+| Line item 2 | value | value | value | change |
+| ... | ... | ... | ... | ... |
+| **SECTION TOTAL** | **value** | **value** | **value** | **change** |
+
+*Footnotes for this section:*
+(a) Explanation for footnote marker (a)...
+(b) Explanation for footnote marker (b)...
+
+---
+
+<!-- SECTION_ID: [document]_[next_section] -->
+## [Document Title] - [Next Section Name]
+
+[Continue same format...]
+
+---
+
+### Large Table Rules:
+- Each section is a SELF-CONTAINED unit with headers, data, totals, and footnotes
+- Bold all important totals: **TOTAL**, **NET INCOME**, **SUBTOTAL**
+- Preserve indentation hierarchy (sub-items indented under parent items)
+- Maintain consistent column order across all sections
+- If a row has footnote markers (a), (b), (1), etc., include the footnote text within that section
+
+## FOOTNOTE HANDLING:
+- Place footnotes IMMEDIATELY after the section/chart they belong to
+- Format: `*Footnotes:*` followed by each footnote on its own line
+- Preserve footnote markers exactly as shown: (a), (b), ¹, ², etc.
+- Do NOT consolidate all footnotes at the end of the page
+- Each section's footnotes must appear within its `---` boundaries
+
+## DATE/PERIOD FORMAT:
+- Preserve original format in content: "30.6.25", "3Q25", "FY2024"
+- For quarter references, use: Q1/Q2/Q3/Q4 followed by year (Q3 2025)
+- For fiscal years: FY2025 or 2025
+
+## SECTION IDENTIFICATION:
+Add a machine-readable comment before each major section:
+<!-- SECTION_ID: brief_slug_describing_content -->
+
+Examples:
+- <!-- SECTION_ID: rwa_movement_q3_q4 -->
+- <!-- SECTION_ID: income_statement_revenue -->
+- <!-- SECTION_ID: cet1_ratio_bridge -->
 
 ## FORMATTING OUTPUT:
 - Use markdown syntax throughout
 - Tables: | Header | Header | format
-- Bold: **important terms**
-- Italics: *quotes and emphasis*
+- Bold: **important terms and totals**
+- Italics: *summaries, quotes, and emphasis*
 - Blockquotes: > for extended quotes
+- Section separators: --- (three dashes)
 
 ## PREPROCESSING CONTEXT (reference only - may contain errors, verify against image):
 ---
@@ -330,7 +440,7 @@ For waterfall/bridge charts:
 Extract ALL content now. Start directly with the document content, no introduction.
 """
 
-        # Prepare message with image
+        # Prepare message with image (correct format for gen_ai_hub proxy)
         message = {
             "role": "user",
             "content": [
@@ -344,10 +454,14 @@ Extract ALL content now. Start directly with the document content, no introducti
             ]
         }
         
-        # Send to Bedrock
+        # Send to Bedrock via proxy
         response = bedrock_client.converse(
             modelId=MODEL_ID,
-            messages=[message]
+            messages=[message],
+            inferenceConfig={
+                "maxTokens": 8190,    # Increased output limit (was default ~4096)
+                "temperature": 0.1     # Low temp for consistent extraction
+            }
         )
         
         # Extract response text
